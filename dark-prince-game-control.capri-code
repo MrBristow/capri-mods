@@ -1,0 +1,498 @@
+// capri-mod: 1
+// id: dark-prince-game-control
+// name: Dark Prince - Steadier Game Control
+// version: 1.0.2
+// author: ChatGPT for Bristow
+// description: Capri Windows 0.8.9: bounded camera turns, movement profiles and failed-action feedback. Open Options after enabling. No guarantee of wins or human reflexes.
+// permissions: tools, screen
+// requires: api 3
+
+// Standalone Windows code mod. Import this file directly in Mainframe > Mods.
+// Compatibility target: Capri v0.8.9, commit
+// 6f719c4269b0fa0e841587f072a1b1594eebcb91 (11 November 2026).
+// 1.0.2 removes the newer job-skill-list dependency and uses the verified
+// GameWindow(Sight) method. Guidance is delivered through action results.
+// Private native contracts are checked before reversible hooks are installed.
+// No network, additional model requests, background timer or screenshot
+// polling. Native Capri input functions still perform and release all input.
+// A compatibility failure does not bypass any check or replay an action.
+// Options: Balanced initially; Precision for smaller steps; Travel for longer
+// movement. Shorter steps can increase model calls. Stop the game job before
+// switching profiles. Turn this mod off to restore native control.
+// This is input conditioning, not a universal game-playing or targeting model.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Globalization;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Windows.Forms;
+using CapriDesktop;
+
+public sealed class DarkPrinceGameControl : ICapriMod
+{
+    private const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+    internal const string Guidance = "Steadier Game Control: keep one target and a usable view; do not recenter after every action. " +
+        "Use the latest screenshot, confirmed game bindings and visible cooldowns. A camera correction may be partial: reobserve before correcting again. " +
+        "After a failed action, check focus, menus, range and cooldown before retrying. Do not invent distances or combo timings. " +
+        "Prefer confirmed skill keys to sweeping the pointer in mouse-lock mode. Leave zoom and camera mode stable. " +
+        "Keep commentary quiet except direct answers or a useful round-end line. Stop when asked; never claim an unobserved hit or win.";
+
+    private ICapriHost host;
+    private object companion;
+    private Bridge bridge;
+    private Hook actHook, useHook;
+    private readonly object gate = new object();
+    private volatile bool running, faulted;
+    private volatile Options options = new Options();
+    private Session session;
+    private long checkedActions, adjustedActions, heldActions, nativeCalls;
+    private double nativeMilliseconds;
+    private string status = "Not started.";
+    [ThreadStatic] private static HashSet<DarkPrinceGameControl> dispatching;
+
+    internal sealed class Options
+    {
+        internal bool Enabled = true, SteadyCamera = true, ShortMoves = true, Grounded = true;
+        internal int Profile = 1;
+        internal double WalkLimit { get { return Profile == 0 ? .60 : Profile == 2 ? 3.0 : 1.25; } }
+        internal double YawLimit { get { return Profile == 0 ? 18 : Profile == 2 ? 45 : 30; } }
+        internal double PitchLimit { get { return Profile == 0 ? 6 : Profile == 2 ? 15 : 10; } }
+        internal double PointXLimit { get { return Profile == 0 ? .10 : Profile == 2 ? .22 : .15; } }
+        internal double PointYLimit { get { return Profile == 0 ? .04 : Profile == 2 ? .10 : .07; } }
+    }
+
+    private sealed class Session
+    {
+        internal WeakReference Job;
+        internal object CameraPicture;
+        internal bool Announced;
+        internal string LastFailure = "";
+        internal int Failures;
+    }
+
+    private sealed class Prepared
+    {
+        internal object Args;
+        internal string Note, Skip;
+        internal bool Camera;
+    }
+
+    public void Start(ICapriHost capri)
+    {
+        if (running) return;
+        host = capri;
+        if (host.Api < 3 || !host.Has("tools") || !host.Has("screen"))
+            throw new InvalidOperationException("Game Control needs Windows Mod API 3 and its declared tools/screen permissions.");
+        companion = host.Ui.Window;
+        if (companion == null) throw new InvalidOperationException("Game Control needs Capri for Windows.");
+        bridge = new Bridge(companion);
+        options = LoadOptions();
+        actHook = new Hook(bridge.Act, this, false);
+        useHook = new Hook(bridge.Use, this, true);
+        faulted = false;
+        try
+        {
+            actHook.Install();
+            useHook.Install();
+            running = true;
+            host.Ui.SetOptions("Game Control", MakeOptions);
+            status = "Ready. Applies only during a recognized game job.";
+            host.Log("Game Control 1.0.2 ready; compatibility target is Windows Capri 0.8.9. Open Options for Precision, Balanced or Travel. Model reaction speed and game knowledge are unchanged.");
+        }
+        catch { Stop(); throw; }
+    }
+
+    public bool Heard(string words) { return false; }
+
+    public void Stop()
+    {
+        running = false;
+        if (actHook != null) actHook.Restore();
+        if (useHook != null) useHook.Restore();
+        lock (gate) { session = null; status = "Disabled; native control restored."; }
+        // If another mod retains our wrapper, it forwards directly while stopped.
+    }
+
+    private Options LoadOptions()
+    {
+        Options o = new Options();
+        o.Enabled = host.Store.Flag("enabled", true);
+        o.SteadyCamera = host.Store.Flag("steady-camera", true);
+        o.ShortMoves = host.Store.Flag("short-moves", true);
+        o.Grounded = host.Store.Flag("grounded", true);
+        double p = host.Store.Number("profile", 1);
+        o.Profile = Finite(p) && p >= 0 && p <= 2 ? (int)p : 1;
+        return o;
+    }
+
+    private void SaveOptions(Options o)
+    {
+        options = o;
+        host.Store.Set("enabled", o.Enabled);
+        host.Store.Set("steady-camera", o.SteadyCamera);
+        host.Store.Set("short-moves", o.ShortMoves);
+        host.Store.Set("grounded", o.Grounded);
+        host.Store.Set("profile", (double)o.Profile);
+        if (!o.Enabled) lock (gate) session = null;
+    }
+
+    private Control MakeOptions()
+    {
+        Panel panel = new Panel { Width = 560, Height = 650, AutoScroll = true, BackColor = Color.FromArgb(24, 14, 27), ForeColor = Color.FromArgb(255, 219, 239) };
+        panel.Controls.Add(new Label { Left = 16, Top = 12, Width = 520, Height = 76,
+            Text = "STEADIER GAME CONTROL 1.0.2\r\nFor Windows Capri 0.8.9. Start with Balanced. This cannot guarantee wins, human reflexes or eliminate cloud-model latency." });
+        Options current = options;
+        CheckBox enabled = Toggle(panel, "Enable game control adjustments", 90, current.Enabled);
+        ComboBox profile = new ComboBox { Left = 16, Top = 126, Width = 500, DropDownStyle = ComboBoxStyle.DropDownList };
+        profile.Items.AddRange(new object[] { "Precision: 0.60 s movement / smaller camera steps", "Balanced: 1.25 s movement / medium camera steps", "Travel: 3.00 s movement / larger camera steps" });
+        profile.SelectedIndex = current.Profile; panel.Controls.Add(profile);
+        CheckBox camera = Toggle(panel, "Steady camera: bounded corrections; no blind horizon reset", 166, current.SteadyCamera);
+        CheckBox moves = Toggle(panel, "Limit ordinary movement holds (W/A/S/D or arrows)", 202, current.ShortMoves);
+        CheckBox grounded = Toggle(panel, "No automatic obstacle-jump unless the action requests it", 238, current.Grounded);
+        panel.Controls.Add(new Label { Left = 16, Top = 280, Width = 520, Height = 118,
+            Text = "Skill keys, clicks, charged attacks and explicit combos keep their native timing. Camera control modifies native look actions, not raw mouse_move/drag tools.\r\n\r\nShorter moves can mean more model calls. For platforming, turn the automatic-jump option off if the game needs it. Stop the game job before changing profiles." });
+        Label stats = new Label { Left = 16, Top = 452, Width = 520, Height = 142 };
+        panel.Controls.Add(stats);
+        Button save = new Button { Text = "Apply", Left = 16, Top = 410, Width = 150, Height = 30 };
+        save.Click += delegate
+        {
+            SaveOptions(new Options { Enabled = enabled.Checked, Profile = Math.Max(0, profile.SelectedIndex), SteadyCamera = camera.Checked, ShortMoves = moves.Checked, Grounded = grounded.Checked });
+            stats.Text = Diagnostics();
+        };
+        panel.Controls.Add(save);
+        Button refresh = new Button { Text = "Refresh status", Left = 180, Top = 410, Width = 150, Height = 30 };
+        refresh.Click += delegate { stats.Text = Diagnostics(); };
+        panel.Controls.Add(refresh); stats.Text = Diagnostics();
+        return panel;
+    }
+
+    private static CheckBox Toggle(Panel panel, string text, int y, bool value)
+    {
+        CheckBox item = new CheckBox { Left = 16, Top = y, Width = 528, Height = 30, Text = text, Checked = value };
+        panel.Controls.Add(item); return item;
+    }
+
+    private string Diagnostics()
+    {
+        lock (gate)
+        {
+            return status + "\r\nGame actions checked: " + checkedActions + "; adjusted: " + adjustedActions + "; withheld: " + heldActions +
+                "\r\nAverage native execution: " + (nativeCalls == 0 ? "n/a" : (nativeMilliseconds / nativeCalls).ToString("0", CultureInfo.InvariantCulture) + " ms") +
+                " (excludes model thinking and network).\r\nNo extra AI requests or screenshot polling. Escape and Capri's native stop controls still apply.";
+        }
+    }
+
+    private string Dispatch(Hook hook, string tool, object args, object context)
+    {
+        Options o = options;
+        if (!running || faulted || !o.Enabled) return hook.Forward(tool, args, context);
+        if (dispatching == null) dispatching = new HashSet<DarkPrinceGameControl>();
+        if (!dispatching.Add(this)) return hook.Forward(tool, args, context);
+        bool invoked = false;
+        try
+        {
+            // Preserve native release commands and non-input result sentinels.
+            if (!IsInput(tool) || tool == "left_mouse_up")
+            { invoked = true; return hook.Forward(tool, args, context); }
+            object job = bridge.Job.GetValue(companion);
+            object picture = hook.Member ? context : bridge.Shown.GetValue(null);
+            object sight = hook.Member ? (picture == null ? null : bridge.PictureSight.GetValue(picture)) : context;
+            if (job == null || !(bool)bridge.Playing.GetValue(job, null) || sight == null ||
+                !(bool)bridge.GameWindow.Invoke(null, new object[] { sight }))
+            { invoked = true; return hook.Forward(tool, args, context); }
+            // Do not append text to Capri's exact interruption sentinel.
+            if ((bool)bridge.Interrupted.GetValue(null, null)) return (string)bridge.Why.GetValue(null, null);
+            if (((Func<IntPtr>)bridge.Front.GetValue(null))() != (IntPtr)bridge.Window.GetValue(sight))
+                return Withheld("Couldn't act: the game lost focus. Reobserve after the user returns to it; do not steal focus.");
+
+            Session s;
+            lock (gate)
+            {
+                if (session == null || !ReferenceEquals(session.Job.Target, job))
+                    session = new Session { Job = new WeakReference(job) };
+                s = session; checkedActions++;
+            }
+            Prepared p = Prepare(tool, args, picture, sight, hook.Member, o, s);
+            if (p.Skip != null) return Withheld(p.Skip);
+            if (!ReferenceEquals(job, bridge.Job.GetValue(companion)))
+                return Withheld("Couldn't act: the game job changed. Use the current job's observation.");
+            if ((bool)bridge.Interrupted.GetValue(null, null)) return (string)bridge.Why.GetValue(null, null);
+            if (!running || !options.Enabled) { invoked = true; return hook.Forward(tool, args, context); }
+            if (p.Camera) lock (gate) s.CameraPicture = picture;
+            Stopwatch watch = Stopwatch.StartNew();
+            string result;
+            invoked = true;
+            try { result = hook.Forward(tool, p.Args, context); }
+            finally
+            {
+                watch.Stop();
+                lock (gate) { nativeCalls++; nativeMilliseconds += watch.Elapsed.TotalMilliseconds; }
+            }
+            if ((bool)bridge.Stopped.Invoke(null, new object[] { result })) return result;
+            if (!running || !options.Enabled) return result;
+            return Feedback(tool, p, result, s);
+        }
+        catch (Exception error)
+        {
+            faulted = true;
+            lock (gate) status = "Adapter disabled after a runtime error. Native control will handle later actions.";
+            try { host.Log("Game Control adapter disabled: " + error.GetType().Name + ". The current action was not replayed."); } catch { }
+            // Native side effects must never be replayed after an exception.
+            if (invoked) throw;
+            return "Couldn't apply Game Control: its adapter was disabled. No input was sent by this mod for this action; inspect the screen before continuing.";
+        }
+        finally { dispatching.Remove(this); }
+    }
+
+    private Prepared Prepare(string tool, object original, object picture, object sight, bool member, Options o, Session s)
+    {
+        Prepared p = new Prepared { Args = original };
+        if (original == null) return p;
+        if (!member && tool == "look" && o.SteadyCamera)
+        {
+            if (string.Equals(bridge.Text(original, "Level"), "yes", StringComparison.OrdinalIgnoreCase))
+            { p.Skip = "Camera reset withheld: automatic horizon leveling can sweep the view. Use a visible point in the latest screenshot only if the view needs correction."; return p; }
+            if (!ValidPicture(picture, sight, s.Job.Target))
+            { p.Skip = "Camera turn withheld: no matching game screenshot. Obtain a fresh game observation before aiming."; return p; }
+            if (ReferenceEquals(picture, s.CameraPicture))
+            { p.Skip = "Camera turn withheld: this screenshot was already used for a correction. Inspect the next screenshot before another turn."; return p; }
+            object a = bridge.Copy.Invoke(original, null); p.Args = a; p.Camera = true;
+            Size size = (Size)bridge.PictureSize.GetValue(picture);
+            Rectangle area = (Rectangle)bridge.PictureArea.GetValue(picture);
+            Rectangle view = (Rectangle)bridge.Bounds.GetValue(sight);
+            double cx = view.Left + view.Width / 2.0, cy = view.Top + view.Height / 2.0;
+            double? x = bridge.Number(a, "X"), y = bridge.Number(a, "Y");
+            if (x.HasValue != y.HasValue) { p.Skip = "Camera turn withheld: provide both x and y from the current screenshot."; return p; }
+            if (x.HasValue)
+            {
+                if (!Finite(x.Value) || !Finite(y.Value) || x < 0 || y < 0 || x >= size.Width || y >= size.Height)
+                { p.Skip = "Camera turn withheld: target is outside the screenshot or invalid. Reobserve; do not guess coordinates."; return p; }
+                double sx = area.Left + x.Value * area.Width / size.Width;
+                double sy = area.Top + y.Value * area.Height / size.Height;
+                if (sx < view.Left || sx >= view.Right || sy < view.Top || sy >= view.Bottom)
+                { p.Skip = "Camera turn withheld: the target is outside the game viewport."; return p; }
+                double dx = sx - cx, dy = sy - cy;
+                // This is a camera tolerance, never a hitbox or aiming guarantee.
+                if (Math.Sqrt(dx * dx + dy * dy) < Math.Max(8, view.Width / 80.0))
+                { p.Skip = "No camera input: that point is within the native camera correction tolerance. This does not confirm attack alignment."; return p; }
+                double bx = Bound(dx, view.Width * o.PointXLimit), by = Bound(dy, view.Height * o.PointYLimit);
+                if (bx != dx || by != dy)
+                {
+                    bridge.Set(a, "X", (cx + bx - area.Left) * size.Width / area.Width);
+                    bridge.Set(a, "Y", (cy + by - area.Top) * size.Height / area.Height);
+                    p.Note = "Only an intermediate camera target was requested; reobserve the original target before another turn.";
+                }
+                bridge.Set(a, "Right", null); bridge.Set(a, "Up", null);
+            }
+            else
+            {
+                double right = bridge.Number(a, "Right") ?? 0, up = bridge.Number(a, "Up") ?? 0;
+                if (!Finite(right) || !Finite(up)) { p.Skip = "Camera turn withheld: invalid angle."; return p; }
+                double yaw = Bound(right, o.YawLimit), pitch = Bound(up, o.PitchLimit);
+                if (yaw == 0 && pitch == 0) { p.Skip = "No camera input: the requested turn is zero."; return p; }
+                double full = (double)bridge.TurnKnown.Invoke(null, new object[] { (string)bridge.Program.GetValue(sight) ?? "" });
+                if (Finite(full) && full > 0)
+                {
+                    bridge.Set(a, "Right", yaw); bridge.Set(a, "Up", pitch);
+                    if (yaw != right || pitch != up) p.Note = "The requested angle was limited to one step. Reobserve before completing the turn.";
+                }
+                else
+                {
+                    // A screenshot point avoids FullTurn calibration. The focal
+                    // estimate does not establish the game's true FOV or angle.
+                    double focal = view.Height * .75;
+                    double dx = Bound(focal * Math.Tan(yaw * Math.PI / 180), view.Width * o.PointXLimit);
+                    double dy = Bound(-focal * Math.Tan(pitch * Math.PI / 180), view.Height * o.PointYLimit);
+                    double px = (cx + dx - area.Left) * size.Width / area.Width;
+                    double py = (cy + dy - area.Top) * size.Height / area.Height;
+                    if (px < 0 || py < 0 || px >= size.Width || py >= size.Height)
+                    { p.Skip = "Camera turn withheld: the screenshot does not contain the requested correction."; return p; }
+                    bridge.Set(a, "X", px); bridge.Set(a, "Y", py);
+                    bridge.Set(a, "Right", null); bridge.Set(a, "Up", null);
+                    p.Note = "Used a small approximate screen-point correction to avoid blind full-turn calibration. The requested angle is not confirmed; reobserve.";
+                }
+            }
+        }
+        else if ((!member && tool == "walk") || (member && tool == "hold_key"))
+        {
+            string keys = bridge.Text(original, member ? "Text" : "Keys");
+            if (!member && string.IsNullOrWhiteSpace(keys)) keys = "w";
+            if (!OrdinaryMovement(keys)) return p;
+            object a = bridge.Copy.Invoke(original, null); p.Args = a;
+            if (!member && o.Grounded && string.IsNullOrWhiteSpace(bridge.Text(a, "Jump")))
+            { bridge.Set(a, "Jump", "no"); p.Note = "Automatic obstacle-jump disabled for this grounded move; explicitly request a jump when needed."; }
+            if (o.ShortMoves)
+            {
+                double seconds;
+                if (member) seconds = bridge.Number(a, "Duration") ?? 1;
+                else if (!double.TryParse(bridge.Text(a, "Seconds") ?? "2", NumberStyles.Float, CultureInfo.InvariantCulture, out seconds)) seconds = 2;
+                if (!Finite(seconds)) { p.Skip = "Movement withheld: invalid duration."; return p; }
+                if (seconds <= 0) seconds = member ? .1 : 2;
+                if (seconds > o.WalkLimit)
+                {
+                    bridge.Set(a, member ? "Duration" : "Seconds", member ? (object)o.WalkLimit : o.WalkLimit.ToString("0.##", CultureInfo.InvariantCulture));
+                    p.Note = "Movement limited to " + o.WalkLimit.ToString("0.##", CultureInfo.InvariantCulture) + " s. Check the new position before continuing.";
+                }
+            }
+        }
+        return p;
+    }
+
+    private bool ValidPicture(object picture, object sight, object job)
+    {
+        if (job == null || picture == null || !ReferenceEquals(picture, bridge.Shown.GetValue(null)) ||
+            !ReferenceEquals(picture, bridge.JobShown.GetValue(job))) return false;
+        object observed = bridge.PictureSight.GetValue(picture);
+        if (observed == null || (IntPtr)bridge.Window.GetValue(observed) != (IntPtr)bridge.Window.GetValue(sight)) return false;
+        Rectangle view = (Rectangle)bridge.Bounds.GetValue(sight), area = (Rectangle)bridge.PictureArea.GetValue(picture);
+        Size size = (Size)bridge.PictureSize.GetValue(picture);
+        return view.Width > 200 && view.Height > 200 && size.Width > 1 && size.Height > 1 &&
+            area.Width > 0 && area.Height > 0 && area.Contains(view);
+    }
+
+    private string Feedback(string tool, Prepared p, string result, Session s)
+    {
+        string added = p.Note;
+        lock (gate)
+        {
+            if (p.Note != null) adjustedActions++;
+            if (!s.Announced) { added = Join(added, Guidance); s.Announced = true; }
+            if (IsInput(tool) && FailedMotion(result))
+            {
+                s.Failures = s.LastFailure == tool ? s.Failures + 1 : 1;
+                s.LastFailure = tool;
+                added = Join(added, s.Failures >= 2 ?
+                    "Repeated unsuccessful action: stop repeating it. Check menus/focus, obstruction, range and the live control binding, then choose a different supported action." :
+                    "Check the next observation before retrying; do not assume the move succeeded.");
+            }
+            else if (IsInput(tool)) { s.LastFailure = ""; s.Failures = 0; }
+            status = "Active: " + (options.Profile == 0 ? "Precision" : options.Profile == 2 ? "Travel" : "Balanced") + ". Last checked tool: " + tool + ".";
+        }
+        return added == null ? result : (result ?? "Native tool returned no result.") + "\n[Game Control] " + added;
+    }
+
+    private string Withheld(string reason) { lock (gate) { heldActions++; status = reason; } return reason; }
+    private static string Join(string a, string b) { return a == null ? b : a + " " + b; }
+    internal static bool Finite(double n) { return !double.IsNaN(n) && !double.IsInfinity(n); }
+    internal static double Bound(double n, double limit) { return Math.Max(-limit, Math.Min(limit, n)); }
+    internal static bool OrdinaryMovement(string keys)
+    {
+        bool movement = false;
+        foreach (string raw in (keys ?? "").ToLowerInvariant().Split('+'))
+        {
+            string k = raw.Trim();
+            if (k == "w" || k == "a" || k == "s" || k == "d" || k == "up" || k == "down" || k == "left" || k == "right") movement = true;
+            else if (k != "shift") return false;
+        }
+        return movement;
+    }
+    private static bool IsInput(string tool)
+    {
+        switch (tool)
+        {
+            case "look": case "walk": case "mouse_hold": case "press": case "hold_and_press": case "click": case "right_click": case "double_click":
+            case "key": case "hold_key": case "left_click": case "middle_click": case "triple_click": case "mouse_move": case "left_click_drag":
+            case "left_mouse_down": case "left_mouse_up": case "scroll": return true;
+            default: return false;
+        }
+    }
+    internal static bool FailedMotion(string result)
+    {
+        string s = (result ?? "").ToLowerInvariant();
+        return s.Contains("didn't move") || s.Contains("something's in the way") || s.Contains("couldn't") ||
+            s.Contains("no key called") || s.Contains("no action called") || s.Contains("too plain") || s.Contains("as far as the view would go");
+    }
+
+    private sealed class Bridge
+    {
+        internal FieldInfo Job, Act, Use, Shown, JobShown, Front, Window, Bounds, Program, PictureSize, PictureArea, PictureSight;
+        internal PropertyInfo Playing, Interrupted, Why;
+        internal MethodInfo Copy, TurnKnown, Stopped, GameWindow;
+        private readonly Dictionary<string, FieldInfo> args = new Dictionary<string, FieldInfo>();
+        internal Bridge(object owner)
+        {
+            Type c = owner.GetType().Assembly.GetType("CapriDesktop.Computer", true);
+            Job = NeedField(owner.GetType(), "job", null);
+            Type j = Job.FieldType, a = c.Assembly.GetType("CapriDesktop.ToolArguments", true),
+                s = c.Assembly.GetType("CapriDesktop.Sight", true), p = c.Assembly.GetType("CapriDesktop.Picture", true);
+            Act = NeedField(c, "Act", typeof(Func<,,,>).MakeGenericType(typeof(string), a, s, typeof(string)));
+            Use = NeedField(c, "Use", typeof(Func<,,,>).MakeGenericType(typeof(string), a, p, typeof(string)));
+            Shown = NeedField(c, "Shown", p); Front = NeedField(c, "Front", typeof(Func<IntPtr>));
+            if (!Act.IsStatic || !Use.IsStatic || !Shown.IsStatic || !Front.IsStatic || Job.IsStatic)
+                throw new InvalidOperationException("Unsupported Capri game-control field layout.");
+            Playing = NeedProperty(j, "Playing", typeof(bool));
+            JobShown = NeedField(j, "shown", p);
+            Interrupted = NeedProperty(c, "Interrupted", typeof(bool)); Why = NeedProperty(c, "Why", typeof(string));
+            Window = NeedField(s, "Window", typeof(IntPtr)); Bounds = NeedField(s, "Bounds", typeof(Rectangle)); Program = NeedField(s, "Program", typeof(string));
+            PictureSize = NeedField(p, "Size", typeof(Size)); PictureArea = NeedField(p, "Area", typeof(Rectangle)); PictureSight = NeedField(p, "Sight", s);
+            Copy = NeedMethod(a, "Copy", a);
+            TurnKnown = NeedMethod(c, "TurnKnown", typeof(double), typeof(string));
+            Stopped = NeedMethod(c, "Stopped", typeof(bool), typeof(string));
+            GameWindow = NeedMethod(c, "GameWindow", typeof(bool), s);
+            if (!Interrupted.GetGetMethod(true).IsStatic || !Why.GetGetMethod(true).IsStatic ||
+                !TurnKnown.IsStatic || !Stopped.IsStatic || !GameWindow.IsStatic)
+                throw new InvalidOperationException("Unsupported Capri game-control method layout.");
+            foreach (string field in new[] { "Level", "Keys", "Text", "Seconds", "Jump" }) args[field] = NeedField(a, field, typeof(string));
+            foreach (string field in new[] { "X", "Y", "Right", "Up", "Duration" }) args[field] = NeedField(a, field, typeof(double?));
+        }
+        internal string Text(object value, string name) { return (string)args[name].GetValue(value); }
+        internal double? Number(object value, string name) { return (double?)args[name].GetValue(value); }
+        internal void Set(object value, string name, object data) { args[name].SetValue(value, data); }
+        private static FieldInfo NeedField(Type type, string name, Type expected)
+        {
+            FieldInfo field = null;
+            for (Type t = type; t != null && field == null; t = t.BaseType) field = t.GetField(name, Any | BindingFlags.DeclaredOnly);
+            if (field == null || (expected != null && field.FieldType != expected))
+                throw new InvalidOperationException("Unsupported Capri game-control field: " + name + ". No hooks installed.");
+            return field;
+        }
+        private static PropertyInfo NeedProperty(Type type, string name, Type expected)
+        {
+            PropertyInfo p = type.GetProperty(name, Any);
+            if (p == null || p.PropertyType != expected || p.GetGetMethod(true) == null)
+                throw new InvalidOperationException("Unsupported Capri game-control property: " + name);
+            return p;
+        }
+        private static MethodInfo NeedMethod(Type type, string name, Type result, params Type[] parameters)
+        {
+            MethodInfo m = type.GetMethod(name, Any, null, parameters, null);
+            if (m == null || m.ReturnType != result)
+                throw new InvalidOperationException("Unsupported Capri game-control method: " + name);
+            return m;
+        }
+    }
+
+    private sealed class Hook
+    {
+        internal readonly bool Member;
+        internal readonly Func<string, object, object, string> Forward;
+        private readonly FieldInfo slot;
+        private readonly Delegate original, replacement;
+        internal Hook(FieldInfo field, DarkPrinceGameControl owner, bool member)
+        {
+            slot = field; Member = member; original = (Delegate)slot.GetValue(null);
+            if (original == null) throw new InvalidOperationException("Capri's native game delegate is not ready.");
+            Type type = slot.FieldType;
+            ParameterInfo[] parameters = type.GetMethod("Invoke").GetParameters();
+            ParameterExpression name = Expression.Parameter(typeof(string), "name"), a = Expression.Parameter(typeof(object), "args"), c = Expression.Parameter(typeof(object), "context");
+            Forward = Expression.Lambda<Func<string, object, object, string>>(
+                Expression.Invoke(Expression.Constant(original, type), name, Expression.Convert(a, parameters[1].ParameterType),
+                Expression.Convert(c, parameters[2].ParameterType)), name, a, c).Compile();
+            ParameterExpression na = Expression.Parameter(parameters[1].ParameterType, "args"), nc = Expression.Parameter(parameters[2].ParameterType, "context");
+            MethodInfo dispatch = typeof(DarkPrinceGameControl).GetMethod("Dispatch", Any);
+            replacement = Expression.Lambda(type,
+                Expression.Call(Expression.Constant(owner), dispatch, Expression.Constant(this), name,
+                Expression.Convert(na, typeof(object)), Expression.Convert(nc, typeof(object))), name, na, nc).Compile();
+        }
+        internal void Install()
+        {
+            if (!ReferenceEquals(slot.GetValue(null), original))
+                throw new InvalidOperationException("Another mod changed game control while this mod started. Try again after stopping the job.");
+            slot.SetValue(null, replacement);
+        }
+        internal void Restore() { if (ReferenceEquals(slot.GetValue(null), replacement)) slot.SetValue(null, original); }
+    }
+}
