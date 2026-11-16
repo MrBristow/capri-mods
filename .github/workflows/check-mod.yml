@@ -1,0 +1,92 @@
+name: Validate Capri 0.8.9 mod
+on:
+  push:
+    paths:
+      - 'dark-prince-game-control.capri-code'
+      - '.github/workflows/check-mod.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Compile and check native 0.8.9 bindings
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $checkDir = Join-Path $env:RUNNER_TEMP 'capri-089-mod-check'
+          New-Item -ItemType Directory -Path $checkDir -Force | Out-Null
+          Set-Location $checkDir
+          $modUrl = "https://raw.githubusercontent.com/$($env:GITHUB_REPOSITORY)/$($env:GITHUB_SHA)/dark-prince-game-control.capri-code"
+          Invoke-WebRequest -Uri $modUrl -OutFile 'GameControl.cs'
+          Invoke-WebRequest -Uri 'https://github.com/lachydotmcg/capri-desktop/releases/download/v0.8.9/Capri.exe' -OutFile 'Capri.exe'
+          $expectedHash = '73598e50881c2ad17d4c5f4debffc4dd2b96590fc6cd39e6f71c5f9a040bbecf'
+          if ((Get-FileHash 'Capri.exe' -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash) {
+            throw 'The official release binary does not match the pinned 0.8.9 digest.'
+          }
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $compiler)) { throw 'The .NET Framework C# compiler is unavailable.' }
+          & $compiler /nologo /target:library /langversion:5 /r:Capri.exe /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Core.dll /out:GameControl.dll GameControl.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Mod compilation failed.' }
+          @'
+          using System;
+          using System.IO;
+          using System.Reflection;
+          using System.Runtime.Serialization;
+          
+          internal static class CompatibilityCheck
+          {
+              private const BindingFlags Hidden = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+              private static int checks;
+          
+              private static void Require(bool condition, string description)
+              {
+                  if (!condition) throw new InvalidOperationException(description);
+                  checks++;
+                  Console.WriteLine("PASS: " + description);
+              }
+          
+              private static int Main()
+              {
+                  try
+                  {
+                      Assembly capri = Assembly.LoadFrom(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Capri.exe"));
+                      Type companion = capri.GetType("CapriDesktop.Companion", true);
+                      // Do not launch Capri, install it, or invoke its mouse/keyboard actions.
+                      // An uninitialized object supplies only its runtime type to the binding check.
+                      object owner = FormatterServices.GetUninitializedObject(companion);
+                      Type bridgeType = typeof(DarkPrinceGameControl).GetNestedType("Bridge", BindingFlags.NonPublic);
+                      object bridge = Activator.CreateInstance(bridgeType, Hidden, null, new object[] { owner }, null);
+                      Require(bridge != null, "Every required private field, property and method binds against the official Capri 0.8.9 binary.");
+                      MethodInfo game = (MethodInfo)bridgeType.GetField("GameWindow", Hidden).GetValue(bridge);
+                      Require(game.Name == "GameWindow" && game.IsStatic && game.ReturnType == typeof(bool) &&
+                          game.GetParameters().Length == 1 && game.GetParameters()[0].ParameterType.FullName == "CapriDesktop.Sight",
+                          "GameWindow uses the one-argument 0.8.9 signature.");
+                      Require(bridgeType.GetField("PlayingWindow", Hidden) == null, "The adapter has no newer PlayingWindow dependency.");
+                      Require(bridgeType.GetField("ReadSkills", Hidden) == null &&
+                          bridgeType.GetField("readSkills", Hidden) == null, "The adapter has no job-skill-list dependency.");
+                      var source = File.ReadAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "GameControl.cs"));
+                      Require(!source.Contains("readSkills") && !source.Contains("PlayingWindow"),
+                          "The shipped source contains neither incompatible member name.");
+                      Require(source.StartsWith("// capri-mod: 1") && source.Contains("// requires: api 3"),
+                          "The single importable source retains its Capri mod header.");
+                      Console.WriteLine("SUCCESS: " + checks + " compatibility checks; compilation passed with C# 5.");
+                      Console.WriteLine("This checks compilation and native member bindings, not live gameplay or Store-edition execution.");
+                      return 0;
+                  }
+                  catch (Exception error)
+                  {
+                      Console.Error.WriteLine(error.ToString());
+                      return 1;
+                  }
+              }
+          }
+          '@ | Set-Content -Path 'CompatibilityCheck.cs' -Encoding UTF8
+          & $compiler /nologo /target:exe /langversion:5 /r:Capri.exe /r:GameControl.dll /r:System.Core.dll /out:CompatibilityCheck.exe CompatibilityCheck.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Compatibility check compilation failed.' }
+          & .\CompatibilityCheck.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Capri 0.8.9 compatibility check failed.' }
+          "Compiled the mod with C# 5 against the pinned official Capri 0.8.9 executable and passed all six binding/header checks. This is not a live-game test." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
